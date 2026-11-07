@@ -1,0 +1,75 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  github-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Generate Release Notes
+        id: release_notes
+        run: |
+          PREVIOUS_TAG=$(git tag --sort=-version:refname | grep -v "^${{ github.ref_name }}$" | head -n 1)
+          if [ -z "$PREVIOUS_TAG" ]; then
+            echo "No previous tag found, using all commits"
+            COMMITS=$(git log --pretty=format:"- %s (%h)" --no-merges)
+          else
+            echo "Generating notes from $PREVIOUS_TAG to ${{ github.ref_name }}"
+            COMMITS=$(git log ${PREVIOUS_TAG}..${{ github.ref_name }} --pretty=format:"- %s (%h)" --no-merges)
+          fi
+          cat > release_notes.md <<EOF
+          ## What's Changed
+
+          ${COMMITS}
+
+          **Full Changelog**: https://github.com/${{ github.repository }}/compare/${PREVIOUS_TAG}...${{ github.ref_name }}
+          EOF
+      - name: Create Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create ${{ github.ref_name }} \
+            --title "${{ github.ref_name }}" \
+            --notes-file release_notes.md
+
+  binaries:
+    needs: github-release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: Build, package, and upload
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          LDFLAGS="-s -w -X github.com/saleslumen/sl/internal/cli.version=${VERSION}"
+          mkdir -p dist
+          for platform in \
+            linux/amd64 linux/arm64 \
+            darwin/amd64 darwin/arm64 \
+            windows/amd64 windows/arm64; do
+            GOOS="${platform%/*}"
+            GOARCH="${platform#*/}"
+            ext=""
+            [ "$GOOS" = windows ] && ext=".exe"
+            out="dist/sl-${GOOS}-${GOARCH}${ext}"
+            echo "Building ${GOOS}/${GOARCH}..."
+            CGO_ENABLED=0 GOOS="$GOOS" GOARCH="$GOARCH" \
+              go build -trimpath -ldflags="$LDFLAGS" -o "$out" .
+            gzip -f -9 "$out"
+          done
+          (cd dist && sha256sum sl-*.gz > checksums.sha256)
+          gh release upload "${GITHUB_REF_NAME}" dist/* --clobber
